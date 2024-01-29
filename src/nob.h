@@ -181,6 +181,7 @@ bool nob_procs_wait(Nob_Procs procs);
 
 // Wait until the process has finished
 bool nob_proc_wait(Nob_Proc proc);
+bool nob_proc_wait_pipes(const char* name, Nob_Proc proc, Nob_Proc proc_stdout, Nob_Proc proc_stderr);
 
 // A command - the main workhorse of Nob. Nob is all about building commands an running them
 typedef struct {
@@ -201,10 +202,11 @@ void nob_cmd_render(Nob_Cmd cmd, Nob_String_Builder *render);
 #define nob_cmd_free(cmd) NOB_FREE(cmd.items)
 
 // Run command asynchronously
-Nob_Proc nob_cmd_run_async(Nob_Cmd cmd);
+Nob_Proc nob_cmd_run_async(Nob_Cmd cmd,Nob_Proc *out_stdout, Nob_Proc *out_stderr);
 
 // Run command synchronously
 bool nob_cmd_run_sync(Nob_Cmd cmd);
+bool nob_cmd_run_sync_noforward(Nob_Cmd cmd);
 
 #ifndef NOB_TEMP_CAPACITY
 #define NOB_TEMP_CAPACITY (8*1024*1024)
@@ -286,7 +288,7 @@ int nob_file_exists(const char *file_path);
                                                                                              \
             Nob_Cmd cmd = {0};                                                               \
             nob_da_append_many(&cmd, argv, argc);                                            \
-            if (!nob_cmd_run_sync(cmd)) exit(1);                                             \
+            if (!nob_cmd_run_sync_noforward(cmd)) exit(1);                                             \
             exit(0);                                                                         \
         }                                                                                    \
     } while(0)
@@ -524,7 +526,7 @@ void nob_cmd_render(Nob_Cmd cmd, Nob_String_Builder *render)
     }
 }
 
-Nob_Proc nob_cmd_run_async(Nob_Cmd cmd)
+Nob_Proc nob_cmd_run_async(Nob_Cmd cmd, Nob_Proc *out_stdout, Nob_Proc *out_stderr)
 {
     if (cmd.count < 1) {
         nob_log(NOB_ERROR, "Could not run empty command");
@@ -540,6 +542,24 @@ Nob_Proc nob_cmd_run_async(Nob_Cmd cmd)
 
 #ifdef _WIN32
     // https://docs.microsoft.com/en-us/windows/win32/procthread/creating-a-child-process-with-redirected-input-and-output
+    SECURITY_ATTRIBUTES saAttr; 
+    saAttr.nLength = sizeof(SECURITY_ATTRIBUTES); 
+    saAttr.bInheritHandle = TRUE; 
+    saAttr.lpSecurityDescriptor = NULL; 
+
+    HANDLE hd_stdout_write;
+    if (out_stdout) {
+        CreatePipe(out_stdout, &hd_stdout_write, &saAttr, 0); // TODO: handle error
+    } else {
+        hd_stdout_write = GetStdHandle(STD_OUTPUT_HANDLE);
+    }
+
+    HANDLE hd_stderr_write;
+    if (out_stdout) {
+        CreatePipe(out_stderr, &hd_stderr_write, &saAttr, 0); // TODO: handle error
+    } else {
+        hd_stderr_write = GetStdHandle(STD_ERROR_HANDLE);
+    }
 
     STARTUPINFO siStartInfo;
     ZeroMemory(&siStartInfo, sizeof(siStartInfo));
@@ -547,8 +567,8 @@ Nob_Proc nob_cmd_run_async(Nob_Cmd cmd)
     // NOTE: theoretically setting NULL to std handles should not be a problem
     // https://docs.microsoft.com/en-us/windows/console/getstdhandle?redirectedfrom=MSDN#attachdetach-behavior
     // TODO: check for errors in GetStdHandle
-    siStartInfo.hStdError = GetStdHandle(STD_ERROR_HANDLE);
-    siStartInfo.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    siStartInfo.hStdError = hd_stderr_write;
+    siStartInfo.hStdOutput = hd_stdout_write;
     siStartInfo.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
     siStartInfo.dwFlags |= STARTF_USESTDHANDLES;
 
@@ -569,6 +589,8 @@ Nob_Proc nob_cmd_run_async(Nob_Cmd cmd)
 
     CloseHandle(piProcInfo.hThread);
 
+   
+  
     return piProcInfo.hProcess;
 #else
     pid_t cpid = fork();
@@ -604,16 +626,95 @@ bool nob_procs_wait(Nob_Procs procs)
     return success;
 }
 
-bool nob_proc_wait(Nob_Proc proc)
+typedef struct {
+    Nob_Proc hd_in, hd_out;
+    int cur_pos;
+    int name_len;
+    char name[32];
+} NobPipeCtx;
+
+NobPipeCtx nob_pipe_ctx_init( const char* name, Nob_Proc hd_in, Nob_Proc hd_out)
+{
+    NobPipeCtx ctx;
+    ctx.hd_in = hd_in;
+    ctx.hd_out = hd_out;
+    ctx.cur_pos = 0;
+    ctx.name_len = snprintf(ctx.name, 32, "[%s] ", name);
+    assert( ctx.name_len < sizeof(ctx.name) );
+
+    return ctx;
+}
+
+//TODO: handle errors
+void nob_peek_pipe_log( NobPipeCtx *ctx, bool hittimeout )
+{
+#ifdef _WIN32
+    CHAR chBuf[4096];
+
+    while(true) {
+        DWORD bytes_available = 0;
+        DWORD bytes_read = 0;
+        DWORD bytes_left = 0;
+        bool success = PeekNamedPipe( ctx->hd_in, chBuf, sizeof(chBuf), &bytes_read, &bytes_available, &bytes_left);
+        assert( success );
+
+        if ( bytes_available == 0 ) return;
+
+        DWORD bytes_write = bytes_read;
+
+        int line_end = ctx->cur_pos;
+        for( ; line_end < bytes_read; line_end++ )
+        {
+            if (chBuf[line_end] == '\n') {
+                bytes_write = line_end+1;
+                ctx->cur_pos = 0;
+                goto print_name;
+            }
+        }
+        if (!hittimeout) goto print_name;
+        if (bytes_available > sizeof(chBuf))
+        {
+            nob_log(NOB_ERROR, "%s %d", "line was too long, dumping content", bytes_available);
+            goto forward_content;
+        }
+        ctx->cur_pos = line_end;
+        return;
+
+print_name:
+        WriteFile(ctx->hd_out, ctx->name, ctx->name_len, NULL, NULL); 
+forward_content:
+   
+        DWORD dwRead, dwWritten; 
+        BOOL bSuccess;
+
+        bSuccess = ReadFile(ctx->hd_in, chBuf, bytes_write, &dwRead, NULL); 
+        if (! bSuccess || dwRead == 0) break; 
+
+        bSuccess = WriteFile(ctx->hd_out, chBuf, bytes_write, &dwWritten, NULL); 
+        if (! bSuccess)  break; 
+    
+    }
+#else
+#error "please implement :("
+#endif
+}
+
+
+bool nob_proc_wait_timeout(Nob_Proc proc, DWORD timeout, bool *out_timeout)
 {
     if (proc == NOB_INVALID_PROC) return false;
-
+    *out_timeout = false;
 #ifdef _WIN32
     DWORD result = WaitForSingleObject(
                        proc,    // HANDLE hHandle,
-                       INFINITE // DWORD  dwMilliseconds
+                       timeout // DWORD  dwMilliseconds
                    );
 
+    if (result == WAIT_TIMEOUT) {
+        *out_timeout = true;
+        return true;
+    }
+    
     if (result == WAIT_FAILED) {
         nob_log(NOB_ERROR, "could not wait on child process: %lu", GetLastError());
         return false;
@@ -640,7 +741,7 @@ bool nob_proc_wait(Nob_Proc proc)
             nob_log(NOB_ERROR, "could not wait on command (pid %d): %s", proc, strerror(errno));
             return false;
         }
-
+        #error "TODO: implement timeout"
         if (WIFEXITED(wstatus)) {
             int exit_status = WEXITSTATUS(wstatus);
             if (exit_status != 0) {
@@ -661,11 +762,49 @@ bool nob_proc_wait(Nob_Proc proc)
 #endif
 }
 
-bool nob_cmd_run_sync(Nob_Cmd cmd)
+
+bool nob_proc_wait_pipes(const char* name, Nob_Proc cmd, Nob_Proc cmd_stdout, Nob_Proc cmd_stderr)
 {
-    Nob_Proc p = nob_cmd_run_async(cmd);
+
+    HANDLE hd_stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+    HANDLE hd_stderr = GetStdHandle(STD_ERROR_HANDLE);
+
+
+    bool status;
+    int stdout_position = 0, stderr_position = 0;
+    NobPipeCtx stdout_ctx = nob_pipe_ctx_init( name, cmd_stdout, hd_stdout );
+    NobPipeCtx stderr_ctx = nob_pipe_ctx_init( name, cmd_stderr, hd_stderr );
+    while( true )
+    {
+        bool hittimeout;
+        status = nob_proc_wait_timeout(cmd, 200, &hittimeout);
+        nob_peek_pipe_log( &stdout_ctx, !hittimeout);
+        nob_peek_pipe_log( &stderr_ctx, !hittimeout);
+        if (!status || !hittimeout) break;
+    }
+    return status;
+}
+
+
+bool nob_proc_wait(Nob_Proc proc)
+{
+    bool hittimeout;
+    return nob_proc_wait_timeout(proc, INFINITE, &hittimeout);
+}
+
+bool nob_cmd_run_sync_noforward(Nob_Cmd cmd)
+{
+    Nob_Proc p = nob_cmd_run_async(cmd, NULL, NULL);
     if (p == NOB_INVALID_PROC) return false;
     return nob_proc_wait(p);
+}
+
+bool nob_cmd_run_sync(Nob_Cmd cmd)
+{
+    Nob_Proc cmd_stdout, cmd_stderr;
+    Nob_Proc p = nob_cmd_run_async(cmd, &cmd_stdout, &cmd_stderr);
+    if (p == NOB_INVALID_PROC) return false;
+    return nob_proc_wait_pipes(cmd.items[0], p, cmd_stdout, cmd_stderr);
 }
 
 char *nob_shift_args(int *argc, char ***argv)

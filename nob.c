@@ -32,9 +32,8 @@ char* cstrcat(char* a, char* b)
 
 int main( int argc, const char* argv[] ) 
 {
+	if (!nob_mkdir_if_not_exists("build")) return 1; // TODO: move this into nob.h
 	NOB_GO_REBUILD_URSELF( argc, argv );
-
-	if (!nob_mkdir_if_not_exists("build")) return 1;
 
 	Nob_Cmd cmd = {0};
 	cmd.count = 0;
@@ -48,7 +47,6 @@ int main( int argc, const char* argv[] )
 			nob_cmd_append(&cmd, cstrcat("src/", sourcefile));
 		}
 	});
-	
 
 	//nob_cmd_append(&cmd, "-Wall");
 	//nob_cmd_append(&cmd, "/out:build/octree.exe");
